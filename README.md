@@ -13,7 +13,7 @@
 ## 📸 Demo
 
 <!-- Replace below with your demo/gif -->
-![Chatbot Demo]("C:\Users\yuvra\Downloads\ScreenRecording2025-04-17132309-ezgif.com-video-to-gif-converter.gif")
+![Chatbot Demo](assets\ScreenRecording2025-04-17132309-ezgif.com-video-to-gif-converter.gif)
 
 ---
 
