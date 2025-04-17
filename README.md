@@ -12,8 +12,7 @@
 
 ## 📸 Demo
 
-<!-- Replace below with your demo/gif -->
-![Chatbot Demo](assets\ScreenRecording2025-04-17132309-ezgif.com-video-to-gif-converter.gif)
+![ScreenRecording2025-04-17132309-ezgif com-video-to-gif-converter](https://github.com/user-attachments/assets/ac0ab0e2-e099-450d-8811-169bf86aa9ed)
 
 ---
 
@@ -104,3 +103,11 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## ✨ Contribution
 
 If you find this useful, give it a ⭐ and feel free to contribute!
+
+---
+
+## 👨‍💻 Author
+
+Built with ❤️ by [**Yuvraj Kumar**](https://github.com/yuvraj-kumar-dev)
+
+---
