@@ -10,9 +10,13 @@
 
 ---
 
+## 🚀 Live Demo
+
+👉 [Click here to try LawgicAI Chatbot](https://your-streamlit-url.com) 
+
 ## 📸 Demo
 
-![ScreenRecording2025-04-17132309-ezgif com-video-to-gif-converter](https://github.com/user-attachments/assets/ac0ab0e2-e099-450d-8811-169bf86aa9ed)
+![ScreenRecording2025-04-17132309-ezgif com-video-to-gif-converter](https://github.com/user-attachments/assets/ac0ab0e2-e099-450d-8811-169bf86aa9ed) 
 
 ---
 
