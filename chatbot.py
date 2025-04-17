@@ -11,10 +11,11 @@ from dotenv import load_dotenv
 # Load env vars (HF_TOKEN and API_MARKET should be in .env file)
 load_dotenv()
 
-HF_TOKEN = os.getenv("HF_TOKEN")
+HF_TOKEN = st.secrets["HF_TOKEN"]
+
 API_MARKET = os.getenv("API_MARKET")
 huggingface_repo_id = "mistralai/Mistral-7B-Instruct-v0.3"
-DB_FAISS_PATH = "C:/Users/yuvra/OneDrive/Desktop/legal chatbot/vectorstore/db_faiss"
+DB_FAISS_PATH = "/workspaces/LawgicAI-Chatbot/vectorstore/db_faiss"
 
 # Translation API
 SARVAM_URL = "https://api.magicapi.dev/api/v1/sarvam/ai-models/translate"
