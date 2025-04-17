@@ -12,7 +12,7 @@
 
 ## 🚀 Live Demo
 
-👉 [Click here to try LawgicAI Chatbot](https://your-streamlit-url.com) 
+👉 [Try LawgicAI Chatbot Now](https://lawgicai.streamlit.app/) 
 
 ## 📸 Demo
 
