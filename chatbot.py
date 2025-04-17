@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 HF_TOKEN = st.secrets["HF_TOKEN"]
+HF_TOKEN = load_dotenv[HF_TOKEN]
 
 API_MARKET = os.getenv("API_MARKET")
 huggingface_repo_id = "mistralai/Mistral-7B-Instruct-v0.3"
