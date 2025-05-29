@@ -84,12 +84,23 @@ def main():
             vectorstore = get_vectorstore()
             llm = load_llm()
 
-            template = """Use the pieces of information provided in context to answer user's question in a simple user friendly language.
-If you don't know the answer, tell the user to contact any legal official for such information.
-Don't try to answer anything out of the given context.
+            template = """
+You are LawgicAI, a legal information assistant. Only answer questions strictly related to the legal context provided.
+
+- If the user's question is not clearly about a legal matter, politely reply:
+  "I can only help with legal questions. Please ask a question related to law or legal information."
+
+- If you do not find the answer in the context, reply:
+  "Please contact a legal official for such information."
+
+- Do NOT make up information or try to answer irrelevant or personal opinion-based questions.
+
+Use the pieces of information provided in context to answer the user's legal question clearly and simply.
 
 Context: {context}
-Question: {question}"""
+Question: {question}
+"""
+
 
             qa_chain = RetrievalQA.from_chain_type(
                 llm=llm,
