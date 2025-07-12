@@ -1,20 +1,16 @@
 import streamlit as st
 import os
 import requests
-from langchain_huggingface import HuggingFaceEmbeddings
+from huggingface_hub import InferenceClient
 from langchain_community.vectorstores import FAISS
-from langchain.chains import RetrievalQA
-from langchain_core.prompts import PromptTemplate
-from langchain_huggingface import HuggingFaceEndpoint
+from langchain_huggingface import HuggingFaceEmbeddings
 from dotenv import load_dotenv
 
-# Load env vars (HF_TOKEN and API_MARKET should be in .env file)
 load_dotenv()
-
 HF_TOKEN = os.getenv("HF_TOKEN")
 API_MARKET = os.getenv("API_MARKET")
-huggingface_repo_id = "mistralai/Mistral-7B-Instruct-v0.3"
 DB_FAISS_PATH = "C:/Users/yuvra/OneDrive/Desktop/legal chatbot/vectorstore/db_faiss"
+MODEL_ID = "mistralai/Mistral-7B-Instruct-v0.3"
 
 # Translation API
 SARVAM_URL = "https://api.magicapi.dev/api/v1/sarvam/ai-models/translate"
@@ -45,22 +41,47 @@ def translate_text(text, source_lang, target_lang):
 @st.cache_resource
 def get_vectorstore():
     embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    if not os.path.exists(os.path.join(DB_FAISS_PATH, "index.faiss")):
+        st.error("FAISS index not found. Please create it before running the app.")
+        st.stop()
     return FAISS.load_local(DB_FAISS_PATH, embeddings, allow_dangerous_deserialization=True)
 
+#update the load_llm function to use the InferenceClient
 def load_llm():
-    return HuggingFaceEndpoint(
-        repo_id=huggingface_repo_id,
-        temperature=0.5,
-        huggingfacehub_api_token=HF_TOKEN,
-        task="text-generation",
-        model_kwargs={"max_length": 512}
+    return InferenceClient(
+        model=MODEL_ID,
+        provider="together",
+        token=HF_TOKEN
     )
 
-def custom_prompt(template):
-    return PromptTemplate(template=template, input_variables=["context", "question"])
+def get_llm_answer(llm, question, context):
+    prompt = f"""
+You are LawgicAI, a legal information assistant. Only answer questions strictly related to the legal context provided.
+
+- If the user's question is not clearly about a legal matter, politely reply:
+  "I can only help with legal questions. Please ask a question related to law or legal information."
+
+- If you do not find the answer in the context, reply:
+  "Please contact a legal official for such information."
+
+Use only the context provided below.
+
+Context:
+{context}
+
+Question:
+{question}
+"""
+    response = llm.chat.completions.create(
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=512,
+        temperature=0.5
+    )
+    return response.choices[0].message.content
 
 def main():
-    st.title("📚 Lawgic AI Chatbot")
+    st.set_page_config(page_title="LawgicAI Chatbot", page_icon="📚")
+    st.title("📚 LawgicAI Chatbot")
     language = st.radio("Choose your language:", options=["English", "Hindi"])
 
     if 'messages' not in st.session_state:
@@ -82,44 +103,16 @@ def main():
 
         try:
             vectorstore = get_vectorstore()
+            retriever = vectorstore.as_retriever(search_kwargs={'k': 3})
+            docs = retriever.get_relevant_documents(user_input)
+            context = "\n\n".join([doc.page_content for doc in docs])
+
             llm = load_llm()
+            response = get_llm_answer(llm, user_input, context)
 
-            template = """
-You are LawgicAI, a legal information assistant. Only answer questions strictly related to the legal context provided.
-
-- If the user's question is not clearly about a legal matter, politely reply:
-  "I can only help with legal questions. Please ask a question related to law or legal information."
-
-- If you do not find the answer in the context, reply:
-  "Please contact a legal official for such information."
-
-- Do NOT make up information or try to answer irrelevant or personal opinion-based questions.
-
-Use the pieces of information provided in context to answer the user's legal question clearly and simply.
-
-Context: {context}
-Question: {question}
-"""
-
-
-            qa_chain = RetrievalQA.from_chain_type(
-                llm=llm,
-                chain_type="stuff",
-                retriever=vectorstore.as_retriever(search_kwargs={'k': 3}),
-                return_source_documents=True,
-                chain_type_kwargs={'prompt': custom_prompt(template)}
-            )
-
-            response = qa_chain.invoke({'query': user_input})
-            english_response = response["result"]
-            if "Answer:" in english_response:
-                english_response = english_response.split("Answer:")[-1].strip()
-            sources = response["source_documents"]
-
-            final_response = english_response
-
+            final_response = response
             if language == "Hindi":
-                final_response = translate_text(english_response, "en-IN", "hi-IN")
+                final_response = translate_text(response, "en-IN", "hi-IN")
 
             st.chat_message("assistant").markdown(final_response)
             st.session_state.messages.append({"role": "assistant", "content": final_response})
