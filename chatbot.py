@@ -1,124 +1,262 @@
-import streamlit as st
-import os
-import requests
-from huggingface_hub import InferenceClient
-from langchain_community.vectorstores import FAISS
-from langchain_huggingface import HuggingFaceEmbeddings
-from dotenv import load_dotenv
+import logging
+from typing import Annotated, TypedDict, Literal
 
-load_dotenv()
-HF_TOKEN = os.getenv("HF_TOKEN")
-API_MARKET = os.getenv("API_MARKET")
-DB_FAISS_PATH = "C:/Users/yuvra/OneDrive/Desktop/legal chatbot/vectorstore/db_faiss"
-MODEL_ID = "mistralai/Mistral-7B-Instruct-v0.3"
+from langchain_core.documents import Document
+from langchain_core.messages import AIMessage, HumanMessage, BaseMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_groq import ChatGroq
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
 
-# Translation API
-SARVAM_URL = "https://api.magicapi.dev/api/v1/sarvam/ai-models/translate"
+from config import GROQ_API_KEY, LLM_MODEL
+from connect_memory import get_retriever, is_vectorstore_ready
 
-def translate_text(text, source_lang, target_lang):
-    headers = {
-        'x-magicapi-key': API_MARKET,
-        'accept': 'application/json',
-        'Content-Type': 'application/json'
-    }
+log = logging.getLogger(__name__)
 
-    data = {
-        "input": text,
-        "source_language_code": source_lang,
-        "target_language_code": target_lang,
-        "speaker_gender": "Male",
-        "mode": "formal",
-        "model": "mayura:v1",
-        "enable_preprocessing": False
-    }
+# Graph topology:
+#     START -> retrieve -> grade_docs -> generate -> check_hallucination -> END
+#                            | (no relevant docs)
+#                         no_docs → END
 
-    try:
-        response = requests.post(SARVAM_URL, headers=headers, json=data)
-        return response.json().get("result", text)
-    except Exception as e:
-        return f"[Translation Error] {str(e)}"
+# Nodes:
+#   retrieve            : fetch top-k docs from FAISS
+#   grade_docs          : filter docs for relevance using LLM
+#   generate            : produce answer grounded in context
+#   check_hallucination : verify the answer is grounded (retry once if not)
+#   no_docs             : graceful fallback when nothing relevant is found
 
-@st.cache_resource
-def get_vectorstore():
-    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-    if not os.path.exists(os.path.join(DB_FAISS_PATH, "index.faiss")):
-        st.error("FAISS index not found. Please create it before running the app.")
-        st.stop()
-    return FAISS.load_local(DB_FAISS_PATH, embeddings, allow_dangerous_deserialization=True)
 
-#update the load_llm function to use the InferenceClient
-def load_llm():
-    return InferenceClient(
-        model=MODEL_ID,
-        provider="together",
-        token=HF_TOKEN
+# State
+
+class RAGState(TypedDict):
+    messages:        Annotated[list[BaseMessage], add_messages]
+    query:           str
+    retrieved_docs:  list[Document]
+    graded_docs:     list[Document]
+    answer:          str
+    hallucination:   bool   # True if answer is NOT grounded
+    retry_count:     int
+
+
+# LLM
+
+def _build_llm(temperature: float = 0.0) -> ChatGroq:
+    if not GROQ_API_KEY:
+        raise ValueError("GROQ_API_KEY is missing. Set it in your .env file.")
+    return ChatGroq(
+        model=LLM_MODEL,
+        temperature=temperature,
+        api_key=GROQ_API_KEY,
     )
 
-def get_llm_answer(llm, question, context):
-    prompt = f"""
-You are LawgicAI, a legal information assistant. Only answer questions strictly related to the legal context provided.
 
-- If the user's question is not clearly about a legal matter, politely reply:
-  "I can only help with legal questions. Please ask a question related to law or legal information."
+# Prompt Template
 
-- If you do not find the answer in the context, reply:
-  "Please contact a legal official for such information."
+GRADER_PROMPT = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        "You are a relevance grader for a legal AI system about the Constitution of India. "
+        "Given a user question and a retrieved document chunk, decide whether the chunk is "
+        "relevant to answering the question.\n"
+        "Respond with ONLY 'yes' or 'no'.",
+    ),
+    ("human", "Question: {query}\n\nDocument chunk:\n{doc_content}"),
+])
 
-Use only the context provided below.
+RAG_PROMPT = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        """You are Lawgic AI - an expert legal assistant specialised in the Constitution of India.
+Your answers must be:
+- Grounded ONLY in the provided context documents.
+- Accurate, structured, and easy to understand for a non-lawyer.
+- Cite the relevant Article, Part, or Schedule when applicable.
+- If the context does not contain enough information, say so clearly instead of guessing.
 
-Context:
+Context documents:
 {context}
 
-Question:
-{question}
-"""
-    response = llm.chat.completions.create(
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=512,
-        temperature=0.5
-    )
-    return response.choices[0].message.content
+Remember: Do NOT hallucinate. Every claim must be traceable to the context above.""",
+    ),
+    MessagesPlaceholder(variable_name="messages"),
+    ("human", "{query}"),
+])
 
-def main():
-    st.set_page_config(page_title="LawgicAI Chatbot", page_icon="📚")
-    st.title("📚 LawgicAI Chatbot")
-    language = st.radio("Choose your language:", options=["English", "Hindi"])
+HALLUCINATION_PROMPT = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        "You are a hallucination checker for a legal AI.\n"
+        "Given a generated answer and the source context used to produce it, "
+        "decide whether the answer is FULLY grounded in the context.\n"
+        "Respond with ONLY 'grounded' or 'hallucinated'.",
+    ),
+    (
+        "human",
+        "Context:\n{context}\n\nAnswer:\n{answer}",
+    ),
+])
 
-    if 'messages' not in st.session_state:
-        st.session_state.messages = []
+NO_DOCS_RESPONSE = (
+    "I'm sorry, I couldn't find relevant information in the uploaded documents "
+    "to answer your question."
+)
 
-    for msg in st.session_state.messages:
-        st.chat_message(msg['role']).markdown(msg['content'])
 
-    user_input = st.chat_input("Ask your legal question here...")
+# Graph nodes 
 
-    if user_input:
-        original_input = user_input
+def retrieve_node(state: RAGState) -> dict:
+    """Retrieve top-k relevant document chunks from FAISS."""
+    query     = state["query"]
+    retriever = get_retriever()
+    docs      = retriever.invoke(query)
+    log.info("Retrieved %d docs for query: %.60s…", len(docs), query)
+    return {"retrieved_docs": docs}
 
-        if language == "Hindi":
-            user_input = translate_text(user_input, "hi-IN", "en-IN")
 
-        st.chat_message("user").markdown(original_input)
-        st.session_state.messages.append({"role": "user", "content": original_input})
+def grade_docs_node(state: RAGState) -> dict:
+    """Filter retrieved docs for relevance using the LLM as a judge."""
+    llm    = _build_llm()
+    chain  = GRADER_PROMPT | llm | StrOutputParser()
+    query  = state["query"]
+    graded = []
 
-        try:
-            vectorstore = get_vectorstore()
-            retriever = vectorstore.as_retriever(search_kwargs={'k': 3})
-            docs = retriever.get_relevant_documents(user_input)
-            context = "\n\n".join([doc.page_content for doc in docs])
+    for doc in state["retrieved_docs"]:
+        verdict = chain.invoke({"query": query, "doc_content": doc.page_content}).strip().lower()
+        if verdict.startswith("yes"):
+            graded.append(doc)
 
-            llm = load_llm()
-            response = get_llm_answer(llm, user_input, context)
+    log.info("Graded docs: %d/%d relevant", len(graded), len(state["retrieved_docs"]))
+    return {"graded_docs": graded}
 
-            final_response = response
-            if language == "Hindi":
-                final_response = translate_text(response, "en-IN", "hi-IN")
 
-            st.chat_message("assistant").markdown(final_response)
-            st.session_state.messages.append({"role": "assistant", "content": final_response})
+def generate_node(state: RAGState) -> dict:
+    """Generate an answer grounded in the graded context."""
+    llm     = _build_llm(temperature=0.1)
+    chain   = RAG_PROMPT | llm | StrOutputParser()
+    context = "\n\n---\n\n".join(doc.page_content for doc in state["graded_docs"])
+    answer  = chain.invoke({
+        "context":  context,
+        "messages": state["messages"],
+        "query":    state["query"],
+    })
+    log.info("Generated answer (%d chars)", len(answer))
+    return {
+        "answer":   answer,
+        "messages": [AIMessage(content=answer)],
+    }
 
-        except Exception as e:
-            st.error(f"❌ Error: {str(e)}")
 
-if __name__ == "__main__":
-    main()
+def check_hallucination_node(state: RAGState) -> dict:
+    """Verify the answer is grounded in the source context."""
+    llm     = _build_llm()
+    chain   = HALLUCINATION_PROMPT | llm | StrOutputParser()
+    context = "\n\n---\n\n".join(doc.page_content for doc in state["graded_docs"])
+    verdict = chain.invoke({"context": context, "answer": state["answer"]}).strip().lower()
+    is_hallucinated = not verdict.startswith("grounded")
+    log.info("Hallucination check: %s", "HALLUCINATED" if is_hallucinated else "grounded")
+    return {
+        "hallucination": is_hallucinated,
+        "retry_count":   state.get("retry_count", 0) + 1,
+    }
+
+
+def no_docs_node(state: RAGState) -> dict:
+    """Fallback when no relevant documents are found."""
+    return {
+        "answer":   NO_DOCS_RESPONSE,
+        "messages": [AIMessage(content=NO_DOCS_RESPONSE)],
+    }
+
+
+# Edges
+
+def route_after_grading(state: RAGState) -> Literal["generate", "no_docs"]:
+    return "generate" if state["graded_docs"] else "no_docs"
+
+
+def route_after_hallucination_check(
+    state: RAGState,
+) -> Literal["generate", END]:           # type: ignore[valid-type]
+    # Retry generation once if hallucinated, then accept on second attempt
+    if state["hallucination"] and state.get("retry_count", 0) < 2:
+        log.warning("Retrying generation due to hallucination…")
+        return "generate"
+    return END
+
+
+# Graph 
+
+def build_rag_graph() -> StateGraph:
+    """Compile and return the LangGraph RAG pipeline."""
+    graph = StateGraph(RAGState)
+
+    # Nodes
+    graph.add_node("retrieve",            retrieve_node)
+    graph.add_node("grade_docs",          grade_docs_node)
+    graph.add_node("generate",            generate_node)
+    graph.add_node("check_hallucination", check_hallucination_node)
+    graph.add_node("no_docs",             no_docs_node)
+
+    # Edges
+    graph.add_edge(START,          "retrieve")
+    graph.add_edge("retrieve",     "grade_docs")
+    graph.add_conditional_edges("grade_docs", route_after_grading)
+    graph.add_edge("generate",     "check_hallucination")
+    graph.add_conditional_edges("check_hallucination", route_after_hallucination_check)
+    graph.add_edge("no_docs",      END)
+
+    return graph.compile()
+
+
+# Public API
+
+_compiled_graph = None  # module-level singleton
+
+
+def get_graph():
+    """Return the compiled RAG graph (built once, reused)."""
+    global _compiled_graph
+    if _compiled_graph is None:
+        _compiled_graph = build_rag_graph()
+    return _compiled_graph
+
+
+def ask(query: str, history: list[BaseMessage] | None = None) -> dict:
+    """
+    Run the RAG pipeline for a single user query.
+
+    Args:
+        query:   The user's question.
+        history: Previous chat messages for multi-turn context.
+
+    Returns:
+        dict with keys: answer, graded_docs, hallucination
+    """
+    if not is_vectorstore_ready():
+        return {
+            "answer": (
+                "⚠️ The knowledge base is not ready yet. "
+                "Please upload a PDF and click **Build Knowledge Base** first."
+            ),
+            "graded_docs":  [],
+            "hallucination": False,
+        }
+
+    graph = get_graph()
+    initial_state: RAGState = {
+        "messages":       history or [],
+        "query":          query,
+        "retrieved_docs": [],
+        "graded_docs":    [],
+        "answer":         "",
+        "hallucination":  False,
+        "retry_count":    0,
+    }
+
+    result = graph.invoke(initial_state)
+    return {
+        "answer":        result["answer"],
+        "graded_docs":   result.get("graded_docs", []),
+        "hallucination": result.get("hallucination", False),
+    }
