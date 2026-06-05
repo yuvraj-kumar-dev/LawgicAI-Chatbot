@@ -4,8 +4,9 @@ __pycache__/
 *.pyo
 *.pyd
 
-# Env
 .env
-.env/
+
 env/
+
+.devcontainer/
 
